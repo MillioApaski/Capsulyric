@@ -150,7 +150,7 @@ jobs:
             echo "has_signing=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_signing=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Signing secrets are incomplete. Building a debug-signed APK; no releases or external publishing."
+            echo "::notice::Signing secrets are incomplete. Building prerelease with the Gradle debug key and original applicationId; no releases or external publishing."
           fi
 
       - name: Build Package
@@ -195,22 +195,29 @@ jobs:
           path: |
             app/build/outputs/apk/prerelease/app-prerelease-signed.apk
 
-      - name: Build debug APK (no signing secrets)
+      # No custom signing secrets: release/prerelease use Gradle's debug signingConfig
+      # without debug's applicationIdSuffix. Keep the regular application ID.
+      - name: Build prerelease APK with debug key (no signing secrets)
         if: steps.signing.outputs.has_signing != 'true'
-        run: ./gradlew assembleDebug -PversionPrefix="${{ steps.build_meta.outputs.version_prefix }}" -PversionChannel=Debug -PappCodename="${{ steps.build_meta.outputs.codename }}"
+        run: ./gradlew assemblePrerelease -PversionPrefix="${{ steps.build_meta.outputs.version_prefix }}" -PversionChannel="${{ needs.resolve_mode.outputs.channel }}" -PappCodename="${{ steps.build_meta.outputs.codename }}"
 
-      - name: Verify debug APK signature
+      - name: Verify prerelease APK signature and package
         if: steps.signing.outputs.has_signing != 'true'
+        shell: bash
         run: |
-          "${ANDROID_HOME}/build-tools/37.0.0/apksigner" verify --verbose app/build/outputs/apk/debug/app-debug.apk
+          set -euo pipefail
+          APK=app/build/outputs/apk/prerelease/app-prerelease.apk
+          test -s "$APK"
+          "${ANDROID_HOME}/build-tools/37.0.0/apksigner" verify --verbose "$APK"
+          "${ANDROID_HOME}/build-tools/37.0.0/aapt" dump badging "$APK" | grep -F "package: name='com.franco.capsulyric'"
 
-      - name: Upload debug APK
+      - name: Upload prerelease APK (debug key, original package)
         if: steps.signing.outputs.has_signing != 'true'
         uses: actions/upload-artifact@v6
         with:
-          name: Capsulyric-${{ needs.resolve_mode.outputs.channel }}-Debug-Signed
+          name: Capsulyric-${{ needs.resolve_mode.outputs.channel }}-DebugKey-OriginalPackage
           if-no-files-found: error
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/prerelease/app-prerelease.apk
 
       - name: Generate Experiment Metadata
         if: |
