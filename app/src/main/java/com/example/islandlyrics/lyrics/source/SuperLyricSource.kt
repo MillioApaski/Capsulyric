@@ -177,18 +177,12 @@ class SuperLyricSource(
         }
 
         override fun onStop(publisher: String?, data: SuperLyricData?) {
-            AppLogger.getInstance().d(TAG, "onStop: ${publisher ?: data?.title ?: "unknown"}")
-            mainHandler.post { clearPending(); lastLyricKey = "" }
-            // Only propagate the stop signal when MediaMonitorService agrees that nothing is
-            // playing. If MediaSession still reports STATE_PLAYING (e.g. the module fired
-            // prematurely), we skip writing to avoid overriding the authoritative state.
-            val mediaSessionSaysPlaying = LyricRepository.getInstance().isPlaying.value ?: false
-            if (!mediaSessionSaysPlaying) {
-                // Already stopped from MediaMonitorService side — this is redundant but harmless.
-                AppLogger.getInstance().d(TAG, "onStop: MediaSession already stopped, no-op")
+            // The Binder callback must not race the main-thread lyric and metadata state.
+            mainHandler.post {
+                AppLogger.getInstance().d(TAG, "onStop: ${publisher ?: data?.title ?: "unknown"}")
+                clearPending()
+                lastLyricKey = ""
             }
-            // Regardless, reset the dedup cache so the next lyric push is never suppressed.
-            lastLyricKey = ""
         }
     }
 
@@ -211,7 +205,7 @@ class SuperLyricSource(
                 return
             }
 
-            // ── Phase 1: Verify song identity (rely entirely on MediaMonitorService for actual metadata/album art) ──
+            // ── Phase 1: Verify song identity against MediaSession metadata ──
             val liveTitle = liveMeta?.title ?: ""
             val liveArtist = liveMeta?.artist ?: ""
             val livePkg = liveMeta?.packageName ?: ""
@@ -314,10 +308,8 @@ class SuperLyricSource(
             val appName = getAppName(pkg)
             val shouldFetchOnline = parsedLines == null && rule.useOnlineLyrics
 
-            // Dispatch repository writes to main thread so they go through
-            // LiveData.setValue() (synchronous) instead of postValue() (async).
-            // postValue() silently merges consecutive calls, which drops lyrics
-            // when SuperLyric pushes arrive in rapid succession on the Binder pool.
+            // Already serialized on the main thread: LiveData.setValue() must not
+            // coalesce consecutive Binder pushes via postValue().
             run {
                 LyricRepository.getInstance().updateLyric(
                     lyric = lyric,
