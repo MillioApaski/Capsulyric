@@ -62,7 +62,7 @@ jobs:
             echo "has_signing=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_signing=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Signing secrets are incomplete. Building a Gradle debug-signed APK instead of a stable release."
+            echo "::notice::Signing secrets are incomplete. Building release with the Gradle debug key and original applicationId; no formal release is published."
           fi
 
       - name: Build Stable Package
@@ -104,19 +104,26 @@ jobs:
             app/build/outputs/apk/release/app-release-signed.apk
             app/build/outputs/apk/release/app-release-signed.apk.md5
 
-      - name: Build debug APK (no signing secrets)
+      # No custom signing secrets: release uses Gradle's debug signingConfig
+      # without debug's applicationIdSuffix. Keep the regular application ID.
+      - name: Build release APK with debug key (no signing secrets)
         if: steps.signing.outputs.has_signing != 'true'
-        run: ./gradlew assembleDebug -PversionPrefix="${{ steps.build_meta.outputs.version_prefix }}" -PversionChannel=Debug -PappCodename="${{ steps.build_meta.outputs.codename }}"
+        run: ./gradlew assembleRelease -PversionPrefix="${{ steps.build_meta.outputs.version_prefix }}" -PversionChannel=Stable -PappCodename="${{ steps.build_meta.outputs.codename }}"
 
-      - name: Verify debug APK signature
+      - name: Verify release APK signature and package
         if: steps.signing.outputs.has_signing != 'true'
+        shell: bash
         run: |
-          "${ANDROID_HOME}/build-tools/37.0.0/apksigner" verify --verbose app/build/outputs/apk/debug/app-debug.apk
+          set -euo pipefail
+          APK=app/build/outputs/apk/release/app-release.apk
+          test -s "$APK"
+          "${ANDROID_HOME}/build-tools/37.0.0/apksigner" verify --verbose "$APK"
+          "${ANDROID_HOME}/build-tools/37.0.0/aapt" dump badging "$APK" | grep -F "package: name='com.franco.capsulyric'"
 
-      - name: Upload debug APK
+      - name: Upload release APK (debug key, original package)
         if: steps.signing.outputs.has_signing != 'true'
         uses: actions/upload-artifact@v6
         with:
-          name: Capsulyric-Debug-Signed
+          name: Capsulyric-Stable-DebugKey-OriginalPackage
           if-no-files-found: error
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/release/app-release.apk
