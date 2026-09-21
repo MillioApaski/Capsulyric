@@ -8,8 +8,8 @@ internal object SuperLyricTrackMatcher {
         val accepted: Boolean get() = path == MatchPath.PARSED || path == MatchPath.RAW
     }
 
-    private val trailingAnnotation = Regex("""\s*[（(]([^（）()]+)[）)]\s*$""")
-    private val hanCharacter = Regex("[\\u3400-\\u9FFF]")
+    private val cjkCharacter = Regex("[\\u3040-\\u30FF\\u3400-\\u9FFF]")
+    private val latinCharacter = Regex("[A-Za-z]")
     private val versionMarker = Regex(
         """(?i)\b(?:feat\.?|ft\.?|live|remix|mix|version|ver\.?|edit|instrumental|acoustic|cover|demo|radio|explicit|sped|slowed)\b|伴奏|现场|現場|翻唱|纯音乐|純音楽|演奏|重制|重製|版本|完整版"""
     )
@@ -46,17 +46,45 @@ internal object SuperLyricTrackMatcher {
         val left = normalize(first)
         val right = normalize(second)
         if (left.equals(right, ignoreCase = true)) return true
-        // Only a single *trailing* explanatory CJK annotation may be omitted. A title's
-        // actual '(feat. ...)', '(Live)', '(Remix)', etc. must remain part of its identity.
+        // A single trailing translation/description may be omitted. Its parentheses
+        // can contain nested parentheses (e.g. translated anime theme descriptions).
+        // Keep actual title suffixes such as '(feat. ...)', '(Live)', '(Remix)'.
         return removeExplanatorySuffix(left)?.equals(right, ignoreCase = true) == true ||
             removeExplanatorySuffix(right)?.equals(left, ignoreCase = true) == true
     }
 
     private fun removeExplanatorySuffix(title: String): String? {
-        val match = trailingAnnotation.find(title) ?: return null
-        val annotation = match.groupValues[1]
-        if (!hanCharacter.containsMatchIn(annotation) || versionMarker.containsMatchIn(annotation)) return null
-        return title.substring(0, match.range.first).trimEnd().takeIf { it.isNotBlank() }
+        if (title.isEmpty() || (title.last() != ')' && title.last() != '）')) return null
+
+        // Walk backwards to find the opening bracket of the ONE outermost trailing
+        // annotation. A flat regex incorrectly rejects '(译名 (主题曲说明))'.
+        // Track the bracket type so malformed/mismatched brackets cannot be stripped.
+        val expectedOpen = ArrayList<Char>()
+        for (index in title.lastIndex downTo 0) {
+            when (title[index]) {
+                ')' -> expectedOpen.add('(')
+                '）' -> expectedOpen.add('（')
+                '(', '（' -> {
+                    if (expectedOpen.isEmpty() || expectedOpen.removeAt(expectedOpen.lastIndex) != title[index]) {
+                        return null
+                    }
+                    if (expectedOpen.isEmpty()) {
+                        val base = title.substring(0, index).trimEnd().takeIf { it.isNotBlank() } ?: return null
+                        val annotation = title.substring(index + 1, title.lastIndex).trim()
+                        if (annotation.isBlank() || versionMarker.containsMatchIn(annotation)) return null
+
+                        // CJK subtitle/description, or an English alternate title
+                        // attached to an original Japanese/Chinese/Korean-script title.
+                        // Plain English '(Live)' / '(Acoustic)' and arbitrary prefixes
+                        // must never become accepted through fuzzy matching.
+                        val explanatory = cjkCharacter.containsMatchIn(annotation) ||
+                            (cjkCharacter.containsMatchIn(base) && latinCharacter.containsMatchIn(annotation))
+                        return base.takeIf { explanatory }
+                    }
+                }
+            }
+        }
+        return null
     }
 
     private fun normalize(value: String) = value.trim().replace(Regex("""\s+"""), " ")
