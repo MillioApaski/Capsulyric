@@ -25,6 +25,8 @@ package com.example.islandlyrics.lyrics.source
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import androidx.lifecycle.Observer
 import com.example.islandlyrics.core.logging.AppLogger
 import com.example.islandlyrics.lyrics.state.LyricRepository
 import com.example.islandlyrics.rules.ParserRuleHelper
@@ -62,6 +64,55 @@ class SuperLyricSource(
 
     // Deduplicate consecutive identical lyric lines
     private var lastLyricKey = ""
+    private var lastObservedTrackKey: String? = null
+
+    // Main-thread only. Keep at most the latest unverified line for a short
+    // MediaSession/SuperLyric update race; never render it before verification.
+    private data class PendingLyric(
+        val publisher: String?,
+        val data: SuperLyricData,
+        val pkg: String,
+        val expiresAtMs: Long
+    )
+    private var pendingLyric: PendingLyric? = null
+    private val expirePendingRunnable = Runnable {
+        val pending = pendingLyric
+        if (pending != null && SystemClock.elapsedRealtime() >= pending.expiresAtMs) {
+            AppLogger.getInstance().d(TAG, "Expired pending SuperLyric line for ${pending.pkg}")
+            clearPending()
+        }
+    }
+    private val metadataObserver = Observer<LyricRepository.MediaInfo?> { meta ->
+        if (meta != null) {
+            val trackKey = "${meta.packageName}|\u0000|${meta.title}|\u0000|${meta.artist}"
+            if (lastObservedTrackKey != trackKey) {
+                lastLyricKey = ""
+                lastObservedTrackKey = trackKey
+            }
+        }
+        val pending = pendingLyric ?: return@Observer
+        if (meta == null || pending.pkg != meta.packageName ||
+            SystemClock.elapsedRealtime() >= pending.expiresAtMs
+        ) {
+            clearPending()
+            return@Observer
+        }
+        val decision = SuperLyricTrackMatcher.match(
+            publisherPackage = pending.pkg,
+            sessionPackage = meta.packageName,
+            providedTitle = pending.data.title.orEmpty(),
+            providedArtist = pending.data.artist.orEmpty(),
+            parsedTitle = meta.title,
+            parsedArtist = meta.artist,
+            rawTitle = meta.rawTitle,
+            rawArtist = meta.rawArtist
+        )
+        if (decision.accepted) {
+            clearPending()
+            AppLogger.getInstance().d(TAG, "Pending SuperLyric line accepted after MediaSession update via ${decision.path}")
+            processLyric(pending.publisher, pending.data, allowDefer = false)
+        }
+    }
 
     // Cache app-display-names to avoid repeated PackageManager IPC
     private val appNameCache = HashMap<String, String>()
@@ -77,6 +128,7 @@ class SuperLyricSource(
                 currentRetryDelayMs = REGISTER_RETRY_INITIAL_DELAY_MS
                 unavailableWarningLogged = false
                 registerAttemptCount = 0
+                LyricRepository.getInstance().liveMetadata.observeForever(metadataObserver)
                 AppLogger.getInstance().log(TAG, "SuperLyricSource started — receiver registered")
             } catch (t: IllegalStateException) {
                 if (!ParserRuleHelper.hasEnabledSuperLyricRule(context)) {
@@ -120,7 +172,28 @@ class SuperLyricSource(
                 AppLogger.getInstance().d(TAG, "onLyric: null data — ignored")
                 return
             }
+            // Serialize identity checks with MediaSession observations on the main thread.
+            mainHandler.post { processLyric(publisher, data) }
+        }
 
+        override fun onStop(publisher: String?, data: SuperLyricData?) {
+            AppLogger.getInstance().d(TAG, "onStop: ${publisher ?: data?.title ?: "unknown"}")
+            mainHandler.post { clearPending(); lastLyricKey = "" }
+            // Only propagate the stop signal when MediaMonitorService agrees that nothing is
+            // playing. If MediaSession still reports STATE_PLAYING (e.g. the module fired
+            // prematurely), we skip writing to avoid overriding the authoritative state.
+            val mediaSessionSaysPlaying = LyricRepository.getInstance().isPlaying.value ?: false
+            if (!mediaSessionSaysPlaying) {
+                // Already stopped from MediaMonitorService side — this is redundant but harmless.
+                AppLogger.getInstance().d(TAG, "onStop: MediaSession already stopped, no-op")
+            }
+            // Regardless, reset the dedup cache so the next lyric push is never suppressed.
+            lastLyricKey = ""
+        }
+    }
+
+    private fun processLyric(publisher: String?, data: SuperLyricData, allowDefer: Boolean = true) {
+        if (!started || !receiverRegistered) return
             val liveMeta = LyricRepository.getInstance().liveMetadata.value
             val pkg = publisher?.takeIf { it.isNotBlank() } ?: liveMeta?.packageName.orEmpty()
             if (pkg.isBlank()) {
@@ -146,22 +219,40 @@ class SuperLyricSource(
             val providedTitle = data.title.orEmpty()
             val providedArtist = data.artist.orEmpty()
 
-            // 3.x API exposes lightweight title/artist fields only.
-            // Playback state and progress remain fully owned by MediaSession.
-            val isMatch = if (providedTitle.isNotBlank() || providedArtist.isNotBlank()) {
-                val titleMatches = providedTitle.isBlank() || liveTitle.isBlank() || providedTitle.equals(liveTitle, ignoreCase = true)
-                val artistMatches = providedArtist.isBlank() || liveArtist.isBlank() || providedArtist.equals(liveArtist, ignoreCase = true)
-                pkg == livePkg && titleMatches && artistMatches
-            } else {
-                pkg == livePkg
-            }
-
-            if (!isMatch) {
-                updateDebugSnapshot(publisher, pkg, data, null, null, null, "mismatch with current session")
-                AppLogger.getInstance().d(TAG, "[$pkg] Lyric ignored. Mismatch w/ current session (${liveMeta?.title} - ${liveMeta?.artist}) vs ($providedTitle - $providedArtist)")
+            // SuperLyric 3.x owns lyric text, while MediaSession owns playback identity.
+            // Prefer the resolved pair, then fall back to the *coherent* raw pair when a
+            // notification parser split a legitimate title at ' - '.
+            val decision = SuperLyricTrackMatcher.match(
+                publisherPackage = pkg,
+                sessionPackage = livePkg,
+                providedTitle = providedTitle,
+                providedArtist = providedArtist,
+                parsedTitle = liveTitle,
+                parsedArtist = liveArtist,
+                rawTitle = liveMeta?.rawTitle.orEmpty(),
+                rawArtist = liveMeta?.rawArtist.orEmpty()
+            )
+            if (!decision.accepted) {
+                // Only defer a same-player, identifiable lyric. Cross-app data is
+                // rejected outright. Never accept a pending line without a fresh
+                // MediaSession identity match.
+                val canDefer = allowDefer && providedTitle.isNotBlank() &&
+                    providedArtist.isNotBlank() && (livePkg.isBlank() || pkg == livePkg)
+                if (canDefer) {
+                    holdPending(publisher, pkg, data)
+                }
+                val reason = "${decision.path}: pkg=$pkg session=$livePkg " +
+                    "parsed=($liveTitle - $liveArtist) raw=(${liveMeta?.rawTitle} - ${liveMeta?.rawArtist}) " +
+                    "SuperLyric=($providedTitle - $providedArtist)"
+                updateDebugSnapshot(publisher, pkg, data, null, null, null,
+                    if (canDefer) "pending: $reason" else reason)
+                AppLogger.getInstance().d(TAG, "Lyric ignored. $reason")
                 return
             }
-
+            clearPending()
+            if (decision.path == SuperLyricTrackMatcher.MatchPath.RAW) {
+                AppLogger.getInstance().d(TAG, "[$pkg] Accepted SuperLyric using raw MediaSession identity")
+            }
             val lyricLine = data.lyric
             val lyric = lyricLine?.asText().orEmpty()
             val translationText = data.translation?.asText()
@@ -227,7 +318,7 @@ class SuperLyricSource(
             // LiveData.setValue() (synchronous) instead of postValue() (async).
             // postValue() silently merges consecutive calls, which drops lyrics
             // when SuperLyric pushes arrive in rapid succession on the Binder pool.
-            mainHandler.post {
+            run {
                 LyricRepository.getInstance().updateLyric(
                     lyric = lyric,
                     app = appName,
@@ -255,21 +346,20 @@ class SuperLyricSource(
                     onlineLyricSource.fetchFor(liveTitle, liveArtist, pkg)
                 }
             }
-        }
+    }
 
-        override fun onStop(publisher: String?, data: SuperLyricData?) {
-            AppLogger.getInstance().d(TAG, "onStop: ${publisher ?: data?.title ?: "unknown"}")
-            // Only propagate the stop signal when MediaMonitorService agrees that nothing is
-            // playing. If MediaSession still reports STATE_PLAYING (e.g. the module fired
-            // prematurely), we skip writing to avoid overriding the authoritative state.
-            val mediaSessionSaysPlaying = LyricRepository.getInstance().isPlaying.value ?: false
-            if (!mediaSessionSaysPlaying) {
-                // Already stopped from MediaMonitorService side — this is redundant but harmless.
-                AppLogger.getInstance().d(TAG, "onStop: MediaSession already stopped, no-op")
-            }
-            // Regardless, reset the dedup cache so the next lyric push is never suppressed.
-            lastLyricKey = ""
-        }
+    private fun holdPending(publisher: String?, pkg: String, data: SuperLyricData) {
+        clearPending()
+        pendingLyric = PendingLyric(
+            publisher = publisher, data = data, pkg = pkg,
+            expiresAtMs = SystemClock.elapsedRealtime() + PENDING_LYRIC_TIMEOUT_MS
+        )
+        mainHandler.postDelayed(expirePendingRunnable, PENDING_LYRIC_TIMEOUT_MS)
+    }
+
+    private fun clearPending() {
+        pendingLyric = null
+        mainHandler.removeCallbacks(expirePendingRunnable)
     }
 
     // ── Public lifecycle ──────────────────────────────────────────────────────
@@ -308,13 +398,16 @@ class SuperLyricSource(
             currentRetryDelayMs = REGISTER_RETRY_INITIAL_DELAY_MS
             unavailableWarningLogged = false
             registerAttemptCount = 0
+            LyricRepository.getInstance().liveMetadata.removeObserver(metadataObserver)
             reset()
             AppLogger.getInstance().log(TAG, "SuperLyricSource stopped")
         }
     }
 
     private fun reset() {
+        clearPending()
         lastLyricKey = ""
+        lastObservedTrackKey = null
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -433,5 +526,6 @@ class SuperLyricSource(
         private const val REGISTER_RETRY_INITIAL_DELAY_MS = 5_000L
         private const val REGISTER_RETRY_MAX_DELAY_MS = 5 * 60_000L
         private const val REGISTER_RETRY_MAX_ATTEMPTS = 2
+        private const val PENDING_LYRIC_TIMEOUT_MS = 2_500L
     }
 }
