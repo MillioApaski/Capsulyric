@@ -39,8 +39,8 @@ internal object SuperLyricTrackMatcher {
     }
 
     private fun pairMatches(title: String, artist: String, candidateTitle: String, candidateArtist: String): Boolean =
-        (title.isBlank() || candidateTitle.isBlank() || titleMatches(title, candidateTitle)) &&
-            (artist.isBlank() || candidateArtist.isBlank() || normalize(artist).equals(normalize(candidateArtist), ignoreCase = true))
+        (title.isBlank() || (candidateTitle.isNotBlank() && titleMatches(title, candidateTitle))) &&
+            (artist.isBlank() || (candidateArtist.isNotBlank() && normalize(artist).equals(normalize(candidateArtist), ignoreCase = true)))
 
     internal fun titleMatches(first: String, second: String): Boolean {
         val left = normalize(first)
