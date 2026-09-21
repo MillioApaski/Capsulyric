@@ -11,7 +11,6 @@ on:
       - '.gitignore'
       - 'screenshots/**'
       - 'LICENSE'
-      - '.github/**'
   workflow_dispatch:
     inputs:
       channel:
@@ -137,17 +136,38 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build Package
-        run: ./gradlew assemblePrerelease -PversionPrefix="${{ steps.build_meta.outputs.version_prefix }}" -PversionChannel="${{ needs.resolve_mode.outputs.channel }}" -PappCodename="${{ steps.build_meta.outputs.codename }}"
-
-      - name: Sign APKs
+      - name: Check signing credentials
+        id: signing
+        shell: bash
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "$SIGNING_KEY" | base64 --decode > release.keystore
+          if [ -n "$SIGNING_KEY" ] && [ -n "$KEY_ALIAS" ] && \
+             [ -n "$KEY_STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "has_signing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_signing=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Signing secrets are incomplete. Building a debug-signed APK; no releases or external publishing."
+          fi
+
+      - name: Build Package
+        if: steps.signing.outputs.has_signing == 'true'
+        run: ./gradlew assemblePrerelease -PversionPrefix="${{ steps.build_meta.outputs.version_prefix }}" -PversionChannel="${{ needs.resolve_mode.outputs.channel }}" -PappCodename="${{ steps.build_meta.outputs.codename }}"
+
+      - name: Sign APKs
+        if: steps.signing.outputs.has_signing == 'true'
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          printf '%s' "$SIGNING_KEY" | base64 --decode > release.keystore
+          trap 'rm -f release.keystore' EXIT
+          test -s release.keystore
           
           # Sign package generated from the prerelease build type.
           STD_APK=$(find app/build/outputs/apk/prerelease -name "*.apk" ! -name "*-signed.apk" | head -n 1)
@@ -159,9 +179,8 @@ jobs:
             --out app/build/outputs/apk/prerelease/app-prerelease-signed.apk \
             "$STD_APK"
 
-          rm release.keystore
-
       - name: Generate MD5 Checksum
+        if: steps.signing.outputs.has_signing == 'true'
         id: md5
         run: |
           MD5_VALUE=$(md5sum app/build/outputs/apk/prerelease/app-prerelease-signed.apk | awk '{print $1}')
@@ -169,14 +188,33 @@ jobs:
 
 
       - name: Upload Signed Artifact
+        if: steps.signing.outputs.has_signing == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: Capsulyric-${{ needs.resolve_mode.outputs.channel }}-Signed
           path: |
             app/build/outputs/apk/prerelease/app-prerelease-signed.apk
 
+      - name: Build debug APK (no signing secrets)
+        if: steps.signing.outputs.has_signing != 'true'
+        run: ./gradlew assembleDebug -PversionPrefix="${{ steps.build_meta.outputs.version_prefix }}" -PversionChannel=Debug -PappCodename="${{ steps.build_meta.outputs.codename }}"
+
+      - name: Verify debug APK signature
+        if: steps.signing.outputs.has_signing != 'true'
+        run: |
+          "${ANDROID_HOME}/build-tools/37.0.0/apksigner" verify --verbose app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload debug APK
+        if: steps.signing.outputs.has_signing != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: Capsulyric-${{ needs.resolve_mode.outputs.channel }}-Debug-Signed
+          if-no-files-found: error
+          path: app/build/outputs/apk/debug/app-debug.apk
+
       - name: Generate Experiment Metadata
         if: |
+          steps.signing.outputs.has_signing == 'true' &&
           github.event_name == 'push' &&
           needs.resolve_mode.outputs.is_preview != 'true' &&
           !contains(github.event.head_commit.message, '[assemble only]')
@@ -242,6 +280,7 @@ jobs:
 
       - name: Delete old Canary releases and tags
         if: |
+          steps.signing.outputs.has_signing == 'true' &&
           github.event_name == 'push' &&
           needs.resolve_mode.outputs.is_preview != 'true' &&
           !contains(github.event.head_commit.message, '[assemble only]')
@@ -262,6 +301,7 @@ jobs:
 
       - name: Delete old Canary releases on Gitee
         if: |
+          steps.signing.outputs.has_signing == 'true' &&
           github.event_name == 'push' &&
           needs.resolve_mode.outputs.is_preview != 'true' &&
           !contains(github.event.head_commit.message, '[assemble only]') &&
@@ -294,6 +334,7 @@ jobs:
 
       - name: Rolling Experiment Release
         if: |
+          steps.signing.outputs.has_signing == 'true' &&
           github.event_name == 'push' &&
           needs.resolve_mode.outputs.is_preview != 'true' &&
           !contains(github.event.head_commit.message, '[assemble only]')
@@ -312,6 +353,7 @@ jobs:
 
       - name: Prepare Gitee Canary body
         if: |
+          steps.signing.outputs.has_signing == 'true' &&
           github.event_name == 'push' &&
           needs.resolve_mode.outputs.is_preview != 'true' &&
           !contains(github.event.head_commit.message, '[assemble only]') &&
@@ -326,6 +368,7 @@ jobs:
 
       - name: Sync Experiment Release to Gitee
         if: |
+          steps.signing.outputs.has_signing == 'true' &&
           github.event_name == 'push' &&
           needs.resolve_mode.outputs.is_preview != 'true' &&
           !contains(github.event.head_commit.message, '[assemble only]') &&
@@ -345,6 +388,7 @@ jobs:
       - name: Publish Experiment Release to AppShare
         id: appshare_publish
         if: |
+          steps.signing.outputs.has_signing == 'true' &&
           github.event_name == 'push' &&
           needs.resolve_mode.outputs.is_preview != 'true' &&
           !contains(github.event.head_commit.message, '[assemble only]')
@@ -374,6 +418,7 @@ jobs:
       - name: Upload Experiment APK to LanZouCloud
         id: lanzou_upload
         if: |
+          steps.signing.outputs.has_signing == 'true' &&
           github.event_name == 'push' &&
           needs.resolve_mode.outputs.is_preview != 'true' &&
           !contains(github.event.head_commit.message, '[assemble only]')
@@ -394,7 +439,7 @@ jobs:
             --parent-folder-id "$PARENT_FOLDER_ID"
 
       - name: Prune LanZouCloud experiment history (keep 1)
-        if: ${{ steps.appshare_publish.outcome == 'success' && steps.lanzou_upload.outputs.appshare_link != '' }}
+        if: ${{ steps.signing.outputs.has_signing == 'true' && steps.appshare_publish.outcome == 'success' && steps.lanzou_upload.outputs.appshare_link != '' }}
         continue-on-error: true
         timeout-minutes: 10
         env:
