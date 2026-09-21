@@ -74,4 +74,8 @@ class SuperLyricTrackMatcherTest {
         assertTrue(match("", "Singer", "Song", "Singer").accepted)
         assertTrue(match("Song", "", "Song", "Singer").accepted)
     }
+
+    @Test fun missingRawFieldsCannotBypassParsedIdentityMismatch() {
+        assertFalse(match("Song", "Singer", "Wrong", "Artist", "", "").accepted)
+    }
 }
