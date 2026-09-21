@@ -48,17 +48,38 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build Stable Package
-        run: ./gradlew assembleRelease -PversionPrefix="${{ steps.build_meta.outputs.version_prefix }}" -PversionChannel=Stable -PappCodename="${{ steps.build_meta.outputs.codename }}"
-
-      - name: Sign Release APK
+      - name: Check signing credentials
+        id: signing
+        shell: bash
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "$SIGNING_KEY" | base64 --decode > release.keystore
+          if [ -n "$SIGNING_KEY" ] && [ -n "$KEY_ALIAS" ] && \
+             [ -n "$KEY_STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "has_signing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_signing=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Signing secrets are incomplete. Building a Gradle debug-signed APK instead of a stable release."
+          fi
+
+      - name: Build Stable Package
+        if: steps.signing.outputs.has_signing == 'true'
+        run: ./gradlew assembleRelease -PversionPrefix="${{ steps.build_meta.outputs.version_prefix }}" -PversionChannel=Stable -PappCodename="${{ steps.build_meta.outputs.codename }}"
+
+      - name: Sign Release APK
+        if: steps.signing.outputs.has_signing == 'true'
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          printf '%s' "$SIGNING_KEY" | base64 --decode > release.keystore
+          trap 'rm -f release.keystore' EXIT
+          test -s release.keystore
 
           STD_APK=$(find app/build/outputs/apk/release -name "*.apk" ! -name "*-signed.apk" | head -n 1)
           ${ANDROID_HOME}/build-tools/37.0.0/apksigner sign \
@@ -69,16 +90,33 @@ jobs:
             --out app/build/outputs/apk/release/app-release-signed.apk \
             "$STD_APK"
 
-          rm release.keystore
-
       - name: Generate MD5 Checksum
+        if: steps.signing.outputs.has_signing == 'true'
         run: |
           (cd app/build/outputs/apk/release/ && md5sum app-release-signed.apk > app-release-signed.apk.md5)
 
       - name: Upload Stable Signed Artifact
+        if: steps.signing.outputs.has_signing == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: Capsulyric-Stable-Signed
           path: |
             app/build/outputs/apk/release/app-release-signed.apk
             app/build/outputs/apk/release/app-release-signed.apk.md5
+
+      - name: Build debug APK (no signing secrets)
+        if: steps.signing.outputs.has_signing != 'true'
+        run: ./gradlew assembleDebug -PversionPrefix="${{ steps.build_meta.outputs.version_prefix }}" -PversionChannel=Debug -PappCodename="${{ steps.build_meta.outputs.codename }}"
+
+      - name: Verify debug APK signature
+        if: steps.signing.outputs.has_signing != 'true'
+        run: |
+          "${ANDROID_HOME}/build-tools/37.0.0/apksigner" verify --verbose app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload debug APK
+        if: steps.signing.outputs.has_signing != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: Capsulyric-Debug-Signed
+          if-no-files-found: error
+          path: app/build/outputs/apk/debug/app-debug.apk
