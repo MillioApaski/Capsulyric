@@ -47,6 +47,32 @@ class SuperLyricTrackMatcherTest {
         assertEquals(SuperLyricTrackMatcher.MatchPath.RAW, result.path)
     }
 
+    @Test fun nestedCjkSubtitleFromExportedLog() {
+        assertTrue(match(
+            "ゴールデンレイ", "三月のパンタシア",
+            "ゴールデンレイ (金色光芒 (TV动画《莱莎的炼金工房 ～常暗女王与秘密藏身处～》片头曲))",
+            "三月のパンタシア"
+        ).accepted)
+    }
+
+    @Test fun englishAliasOfJapaneseTitleFromExportedLog() {
+        assertTrue(match(
+            "白夜にて", "Albemuth",
+            "白夜にて (At the midnight sun)", "Albemuth"
+        ).accepted)
+    }
+
+    @Test fun rejectMalformedNestedAnnotationAndVersionSuffix() {
+        assertFalse(match(
+            "ゴールデンレイ", "三月のパンタシア",
+            "ゴールデンレイ (金色光芒 (TV动画)",
+            "三月のパンタシア"
+        ).accepted)
+        assertFalse(match("白夜にて", "Albemuth", "白夜にて (Live)", "Albemuth").accepted)
+        assertFalse(match("白夜にて", "Albemuth", "白夜にて (feat. Guest)", "Albemuth").accepted)
+        assertFalse(match("Song", "Singer", "Song (At the midnight sun)", "Singer").accepted)
+    }
+
     @Test fun differentArtistMustFail() {
         assertFalse(match("春を連れて", "Artist A", "春を連れて", "Artist B").accepted)
     }
