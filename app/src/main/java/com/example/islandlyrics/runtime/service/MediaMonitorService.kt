@@ -730,8 +730,19 @@ class MediaMonitorService : NotificationListenerService() {
                 finalLyric  = rawTitle
             } else {
                 // --- STRATEGY 3: Parse-based detection (fallback for other formats) ---
-                // Case A: Title contains "Artist - Title" (e.g. bluetooth media)
-                val titleParse = ParserRuleHelper.parseWithRule(rawTitle ?: "", rule)
+                // Case A: Title contains "Artist - Title" (e.g. bluetooth media).
+                // A non-car-protocol SuperLyric player with an actual MediaSession
+                // artist already has separate title/artist fields. A title such as
+                // "コトノハ - Kotonoha" must NOT be split into a fake artist.
+                // Keep parsing for car/notification protocols and missing artists.
+                val preserveMediaTitle = rule.useSuperLyricApi && !rule.usesCarProtocol &&
+                    !rawArtist.isNullOrBlank() &&
+                    !rawArtist.equals("Unknown", ignoreCase = true)
+                val titleParse = if (preserveMediaTitle) {
+                    Triple("", "", false)
+                } else {
+                    ParserRuleHelper.parseWithRule(rawTitle ?: "", rule)
+                }
                 if (titleParse.third) {
                     finalTitle  = titleParse.first
                     finalArtist = titleParse.second
